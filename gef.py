@@ -97,7 +97,7 @@ HORIZONTAL_LINE = "\u2500"
 VERTICAL_LINE = "\u2502"
 CROSS = "\u2718 "
 TICK = "\u2713 "
-GEF_PROMPT = "gef\u27a4  "
+GEF_PROMPT = "gdb-> "
 GEF_PROMPT_ON = "\001\033[1;32m\002{0:s}\001\033[0m\002".format(GEF_PROMPT)
 GEF_PROMPT_OFF = "\001\033[1;31m\002{0:s}\001\033[0m\002".format(GEF_PROMPT)
 
@@ -2332,6 +2332,11 @@ class MIPS(Architecture):
                  "addi $sp, $sp, 16",]
         return "; ".join(insns)
 
+CHERI_REGS = ["$c0", "$c1", "$c2", "$c3",
+            "$c4", "$c5", "$c6", "$c7", "$c8", "$c9", "$c10", "$c11",
+            "$c12", "$c13", "$c15", "$c16", "$c17", "$c18", "$c19",
+            "$c20", "$c21", "$c22", "$c23", "$c24", "$c25", "$c26",
+            "$c27", "$c28", "$c29", "$c30", "$c31", "$ddc", "$pcc"]
 class MIPSC128(MIPS):
     arch = "MIPSc128"
     mode = "MIPS64c128"
@@ -2348,12 +2353,15 @@ class MIPSC128(MIPS):
             "$gp", "$sp", "$s8", "$ra",
             "$status", "$lo", "$hi", "$badvaddr",
             "$cause", "$pc",
-            "$fcsr", "$fir", "$c0", "$c1", "$c2", "$c3",
-            "$c4", "$c5", "$c6", "$c7", "$c8", "$c9", "$c10", "$c11",
-            "$c12", "$c13", "$c15", "$c16", "$c17", "$c18", "$c19",
-            "$c20", "$c21", "$c22", "$c23", "$c24", "$c25", "$c26",
-            "$c27", "$c28", "$c29", "$c30", "$c31", "$ddc", "$pcc", '$cap_cause', '$cap_valid']
+            "$fcsr", "$fir"]+CHERI_REGS
 
+    @property
+    def pc(self):
+        return get_register("$pcc")
+
+    @property
+    def sp(self):
+        return get_register("$c11")
 
 
 
@@ -2500,11 +2508,18 @@ def get_register(regname):
     """Return a register's value."""
     try:
         value = gdb.parse_and_eval(regname)
-        if value.type.name == "cheri_cap128":
-            cap_attrs = str(value["attr"])
-            reg = int(value["cursor"])
-        return to_unsigned_long(value) if value.type.code == gdb.TYPE_CODE_INT else int(value)
+
+        if value.type.code == gdb.TYPE_CODE_INT:
+            value = to_unsigned_long(value)
+
+        elif value.type.name == "cheri_cap128":
+            cap_attrs = str(value["attr"]) #todo
+            value = int(value["cursor"])
+
+        return int(value)
     except gdb.error:
+        if "$" not in regname:
+            return get_register("$"+regname)
         assert(regname[0] == '$')
         regname = regname[1:]
         try:
@@ -4503,6 +4518,8 @@ class GefThemeCommand(GenericCommand):
         self.add_setting("address_heap", "green", "Color to use when a heap address is found")
         self.add_setting("address_code", "red", "Color to use when a code address is found")
         self.add_setting("source_current_line", "green", "Color to use for the current code line in the source window")
+        self.add_setting("valid_capability", "bold green", "Color to use for a valid capability register")
+        self.add_setting("invalid_capability", "gray", "Color to use for an invalid capability register")
         return
 
     def do_invoke(self, args):
@@ -7197,7 +7214,7 @@ class ContextCommand(GenericCommand):
         super(ContextCommand, self).__init__()
         self.add_setting("enable", True, "Enable/disable printing the context when breaking")
         self.add_setting("show_stack_raw", False, "Show the stack pane as raw hexdump (no dereference)")
-        self.add_setting("show_registers_raw", False, "Show the registers pane with raw values (no dereference)")
+        self.add_setting("show_registers_raw", True, "Show the registers pane with raw values (no dereference)")
         self.add_setting("peek_calls", True, "Peek into calls")
         self.add_setting("peek_ret", True, "Peek at return address")
         self.add_setting("nb_lines_stack", 8, "Number of line in the stack pane")
@@ -7208,7 +7225,7 @@ class ContextCommand(GenericCommand):
         self.add_setting("nb_lines_code_prev", 3, "Number of instruction before $pc")
         self.add_setting("ignore_registers", "", "Space-separated list of registers not to display (e.g. '$cs $ds $gs')")
         self.add_setting("clear_screen", True, "Clear the screen before printing the context")
-        self.add_setting("layout", "legend regs code args source memory threads trace extra", "Change the order/presence of the context sections")
+        self.add_setting("layout", "legend regs -stack code args source memory threads trace extra", "Change the order/presence of the context sections")
         self.add_setting("redirect", "", "Redirect the context information to another TTY")
 
         if "capstone" in list(sys.modules.keys()):
@@ -7240,12 +7257,13 @@ class ContextCommand(GenericCommand):
             stack_addr_color = get_gef_setting("theme.address_stack")
             heap_addr_color = get_gef_setting("theme.address_heap")
             changed_register_color = get_gef_setting("theme.registers_value_changed")
-
-            gef_print("[ Legend: {} | {} | {} | {} | {} ]".format(Color.colorify("Modified register", changed_register_color),
+            valid_cap = get_gef_setting("theme.valid_capability")
+            gef_print("[ Legend: {} | {} | {} | {} | {} | {}]".format(Color.colorify("Modified register", changed_register_color),
                                                                   Color.colorify("Code", code_addr_color),
                                                                   Color.colorify("Heap", heap_addr_color),
                                                                   Color.colorify("Stack", stack_addr_color),
-                                                                  Color.colorify("String", str_color)
+                                                                  Color.colorify("String", str_color),
+                                                                  Color.colorify("Valid cap", valid_cap)
             ))
         return
 
@@ -7331,16 +7349,29 @@ class ContextCommand(GenericCommand):
         changed_color = get_gef_setting("theme.registers_value_changed")
         regname_color = get_gef_setting("theme.registers_register_name")
 
+        valid_cap_color = get_gef_setting("theme.valid_capability")
+        invalid_cap_color = get_gef_setting("theme.invalid_capability")
+
+        cap_valid = int(gdb.parse_and_eval('$cap_valid'))
+        # temporary, while cap_valid is not working:
+        if cap_valid == 0:
+            cap_valid = 123456789
+        valid_cap_registers = [True if cap_valid & (1 << i) != 0 else False for i in range(64)]
+
         for reg in current_arch.all_registers:
             if reg in ignored_registers:
                 continue
 
             try:
                 r = gdb.parse_and_eval(reg)
+                new_value_type_flag = (r.type.code == gdb.TYPE_CODE_FLAGS)
+
                 if r.type.code == gdb.TYPE_CODE_VOID:
                     continue
+                elif r.type.name == "cheri_cap128":
+                    cap_attrs = str(r["attr"])
+                    r = int(r["cursor"])
 
-                new_value_type_flag = (r.type.code == gdb.TYPE_CODE_FLAGS)
                 new_value = int(r)
 
             except (gdb.MemoryError, gdb.error):
@@ -7361,7 +7392,11 @@ class ContextCommand(GenericCommand):
                 line += "{}: ".format(Color.colorify(padreg, regname_color))
             else:
                 line += "{}: ".format(Color.colorify(padreg, changed_color))
-            if new_value_type_flag:
+            if reg in CHERI_REGS:
+                inx = CHERI_REGS.index(reg)
+                color = valid_cap_color if valid_cap_registers[inx] else invalid_cap_color
+                line += "{:s} ".format(Color.colorify(format_address_spaces(int(value)), color))
+            elif new_value_type_flag:
                 line += "{:s} ".format(format_address_spaces(value))
             else:
                 addr = lookup_address(align_address(int(value)))
