@@ -20,7 +20,7 @@
 #   * x86-32 & x86-64
 #   * arm v5,v6,v7
 #   * aarch64 (armv8)
-#   * mips & mips64
+#   * mips & mips64 & mips64c128
 #   * powerpc & powerpc64
 #   * sparc & sparc64(v9)
 #
@@ -2332,6 +2332,30 @@ class MIPS(Architecture):
                  "addi $sp, $sp, 16",]
         return "; ".join(insns)
 
+class MIPSC128(MIPS):
+    arch = "MIPSc128"
+    mode = "MIPS64c128"
+
+    # http://vhouten.home.xs4all.nl/mipsel/r3000-isa.html
+    all_registers = [
+            "$zero", "$at", "$v0", "$v1",
+            "$a0", "$a1", "$a2", "$a3",
+            "$a4", "$a5", "$a6", "$a7",
+            "$t0", "$t1", "$t2", "$t3",
+            "$s0", "$s1", "$s2", "$s3",
+            "$s4", "$s5", "$s6", "$s7",
+            "$t8", "$t9", "$k0", "$k1",
+            "$gp", "$sp", "$s8", "$ra",
+            "$status", "$lo", "$hi", "$badvaddr",
+            "$cause", "$pc",
+            "$fcsr", "$fir", "$c0", "$c1", "$c2", "$c3",
+            "$c4", "$c5", "$c6", "$c7", "$c8", "$c9", "$c10", "$c11",
+            "$c12", "$c13", "$c15", "$c16", "$c17", "$c18", "$c19",
+            "$c20", "$c21", "$c22", "$c23", "$c24", "$c25", "$c26",
+            "$c27", "$c28", "$c29", "$c30", "$c31", "$ddc", "$pcc", '$cap_cause', '$cap_valid']
+
+
+
 
 def write_memory(address, buffer, length=0x10):
     """Write `buffer` at address `address`."""
@@ -2476,6 +2500,9 @@ def get_register(regname):
     """Return a register's value."""
     try:
         value = gdb.parse_and_eval(regname)
+        if value.type.name == "cheri_cap128":
+            cap_attrs = str(value["attr"])
+            reg = int(value["cursor"])
         return to_unsigned_long(value) if value.type.code == gdb.TYPE_CODE_INT else int(value)
     except gdb.error:
         assert(regname[0] == '$')
@@ -3049,7 +3076,7 @@ def set_arch(arch=None, default=None):
         "RISCV": RISCV, Elf.RISCV: RISCV,
         "SPARC": SPARC, Elf.SPARC: SPARC,
         "SPARC64": SPARC64, Elf.SPARC64: SPARC64,
-        "MIPS": MIPS, Elf.MIPS: MIPS,
+        "MIPS": MIPSC128, Elf.MIPS: MIPSC128,
     }
     global current_arch, current_elf
 
@@ -5855,7 +5882,7 @@ class RemoteCommand(GenericCommand):
             current_arch = X86_64()
         elif arch.startswith("mips"):
             current_elf.e_machine = Elf.MIPS
-            current_arch = MIPS()
+            current_arch = MIPSC128()
         elif arch.startswith("powerpc"):
             current_elf.e_machine = Elf.POWERPC
             current_arch = PowerPC()
@@ -6564,6 +6591,11 @@ class DetailRegistersCommand(GenericCommand):
                 line += Color.colorify("no value", "yellow underline")
                 gef_print(line)
                 continue
+# https://github.com/tupipa/cheri-qemu/blob/3893637e0c16af016ab1301aeab6c25e00fde685/gdb-xml/mips64-cheri-c128.xml
+            cap_attrs = None
+            if reg.type.name == "cheri_cap128":
+                cap_attrs = str(reg["attr"])
+                reg = int(reg["cursor"])
 
             value = align_address(int(reg))
             old_value = ContextCommand.old_registers.get(regname, 0)
@@ -6590,6 +6622,10 @@ class DetailRegistersCommand(GenericCommand):
                 line += str(addr)
             else:
                 line += format_address_spaces(value)
+
+            if cap_attrs is not None:
+                line += cap_attrs
+
             addrs = DereferenceCommand.dereference_from(value)
 
             if len(addrs) > 1:
