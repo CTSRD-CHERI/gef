@@ -91,7 +91,7 @@ from urllib.request import urlopen #pylint: disable=import-error,no-name-in-modu
 lru_cache = functools.lru_cache #pylint: disable=no-member
 
 LEFT_ARROW = " \u2190 "
-RIGHT_ARROW = " \u2192 "
+RIGHT_ARROW = " > " #" \u2192 "
 DOWN_ARROW = "\u21b3"
 HORIZONTAL_LINE = "\u2500"
 VERTICAL_LINE = "\u2502"
@@ -7221,7 +7221,7 @@ class ContextCommand(GenericCommand):
         self.add_setting("grow_stack_down", False, "Order of stack downward starts at largest down to stack pointer")
         self.add_setting("nb_lines_backtrace", 10, "Number of line in the backtrace pane")
         self.add_setting("nb_lines_threads", -1, "Number of line in the threads pane")
-        self.add_setting("nb_lines_code", 6, "Number of instruction after $pc")
+        self.add_setting("nb_lines_code",12, "Number of instruction after $pc")
         self.add_setting("nb_lines_code_prev", 3, "Number of instruction before $pc")
         self.add_setting("ignore_registers", "", "Space-separated list of registers not to display (e.g. '$cs $ds $gs')")
         self.add_setting("clear_screen", True, "Clear the screen before printing the context")
@@ -7646,9 +7646,10 @@ class ContextCommand(GenericCommand):
 
         nb_line = self.get_setting("nb_lines_code")
         fn = symtab.filename
-        if len(fn) > 20:
-            fn = "{}[...]{}".format(fn[:15], os.path.splitext(fn)[1])
-        title = "source:{}+{}".format(fn, line_num + 1)
+        if len(fn) > 80:
+            fn = "{}[...]{}".format(fn[:50], os.path.splitext(fn)[1])
+        title = "source:{}:{}".format(fn, line_num + 1)
+
         cur_line_color = get_gef_setting("theme.source_current_line")
         self.context_title(title)
 
