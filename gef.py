@@ -9675,7 +9675,7 @@ class GefCommand(gdb.Command):
         super().__init__(self._cmdline_, gdb.COMMAND_SUPPORT, gdb.COMPLETE_NONE, True)
         gef.config["gef.follow_child"] = GefSetting(True, bool, "Automatically set GDB to follow child when forking")
         gef.config["gef.readline_compat"] = GefSetting(False, bool, "Workaround for readline SOH/ETX issue (SEGV)")
-        gef.config["gef.debug"] = GefSetting(False, bool, "Enable debug mode for gef") # change me back
+        gef.config["gef.debug"] = GefSetting(False, bool, "Enable debug mode for gef")
         gef.config["gef.autosave_breakpoints_file"] = GefSetting("", str, "Automatically save and restore breakpoints")
         gef.config["gef.extra_plugins_dir"] = GefSetting("", str, "Autoload additional GEF commands from external directory", hooks={"on_write": self.load_extra_plugins})
         gef.config["gef.disable_color"] = GefSetting(False, bool, "Disable all colors in GEF")
