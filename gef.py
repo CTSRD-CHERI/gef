@@ -87,6 +87,8 @@ from typing import (Any, ByteString, Callable, Dict, Generator, Iterable,
                     Iterator, List, Literal, NoReturn, Optional, Sequence, Set, Tuple, Type,
                     Union, TYPE_CHECKING)
 from urllib.request import urlopen
+import cProfile
+import pstats
 
 if TYPE_CHECKING:
     import gdb
@@ -143,7 +145,7 @@ VERTICAL_LINE                          = "│"
 CROSS                                  = "✘ "
 TICK                                   = "✓ "
 BP_GLYPH                               = "●"
-GEF_PROMPT                             = "gef➤  "
+GEF_PROMPT                             = "gef>  "
 GEF_PROMPT_ON                          = f"\001\033[1;32m\002{GEF_PROMPT}\001\033[0m\002"
 GEF_PROMPT_OFF                         = f"\001\033[1;31m\002{GEF_PROMPT}\001\033[0m\002"
 
@@ -453,10 +455,26 @@ def parse_arguments(required_arguments: Dict[Union[str, Tuple[str, str]], Any],
                     optional_arguments: Dict[Union[str, Tuple[str, str]], Any]) -> Callable:
     """Argument parsing decorator."""
 
+    class AttrDict(dict):
+        def __init__(self, *args, **kwargs):
+            super(AttrDict, self).__init__(*args, **kwargs)
+            self.__dict__ = self
+
     def int_wrapper(x: str) -> int: return int(x, 0)
 
     def decorator(f: Callable) -> Optional[Callable]:
         def wrapper(*args: Any, **kwargs: Any) -> Callable:
+            if len(args[1]) == 0:
+                opt_args = {}
+                for opt in optional_arguments:
+                    if isinstance(opt, tuple):
+                        k = opt[0] if '--' in opt[0] else opt[1]
+                    else:
+                        k = opt
+                    kk = k[2:]
+                    opt_args[kk] = optional_arguments[opt]
+                kwargs["arguments"] = AttrDict({**required_arguments, **opt_args})
+                return f(*args, **kwargs)
             parser = argparse.ArgumentParser(prog=args[0]._cmdline_, add_help=True)
             for argname in required_arguments:
                 argvalue = required_arguments[argname]
@@ -497,6 +515,7 @@ def parse_arguments(required_arguments: Dict[Union[str, Tuple[str, str]], Any],
                     parser.add_argument(*argname, type=argtype, default=argvalue)
 
             parsed_args = parser.parse_args(*(args[1:]))
+            # print(parsed_args, args)
             kwargs["arguments"] = parsed_args
             return f(*args, **kwargs)
         return wrapper
@@ -570,14 +589,21 @@ class Address:
         self.value: int = kwargs.get("value", 0)
         self.section: "Section" = kwargs.get("section", None)
         self.info: "Zone" = kwargs.get("info", None)
+        self.src: gdb.Value = None
+        self.cap_info: tuple = None
+        self.valid: bool = kwargs.get("valid", None)
+        if self.valid == None:
+            self.valid = any(map(lambda x: x.page_start <= self.value < x.page_end, gef.memory.maps))
         return
 
     def __str__(self) -> str:
         value = format_address(self.value)
+        if self.cap_info:
+            value += format_cap(self.cap_info)
         code_color = gef.config["theme.address_code"]
         stack_color = gef.config["theme.address_stack"]
         heap_color = gef.config["theme.address_heap"]
-        if self.is_in_text_segment():
+        if self.is_executable():
             return Color.colorify(value, code_color)
         if self.is_in_heap_segment():
             return Color.colorify(value, heap_color)
@@ -590,7 +616,7 @@ class Address:
 
     def is_in_text_segment(self) -> bool:
         return (hasattr(self.info, "name") and ".text" in self.info.name) or \
-            (hasattr(self.section, "path") and get_filepath() == self.section.path and self.section.is_executable())
+            (hasattr(self.section, "path") and get_filepath() == self.section.path and self.is_executable())
 
     def is_in_stack_segment(self) -> bool:
         return hasattr(self.section, "path") and "[stack]" == self.section.path
@@ -603,9 +629,39 @@ class Address:
         derefed = dereference(addr)
         return None if derefed is None else int(derefed)
 
-    @property
-    def valid(self) -> bool:
-        return any(map(lambda x: x.page_start <= self.value < x.page_end, gef.memory.maps))
+    def set_src(self, val) -> None:
+        self.src = val
+        self.cap_info = parse_cap_internal(self.src)
+
+    def is_executable(self) -> bool:
+        if is_cheri() and self.cap_info:
+            tag, caps, _, _, _ = self.cap_info
+            if tag == '1' and 'Execute' in caps:
+                return True
+            else:
+                return False
+        else:
+            return self.section.is_executable() if self.section else False
+
+    def is_readable(self) -> bool:
+        if is_cheri() and self.cap_info:
+            tag, caps, _, _, _ = self.cap_info
+            if tag == '1' and 'Load' in caps:
+                return self.section.is_readable() if self.section else False
+            else:
+                return False
+        else:
+            return self.section.is_readable() if self.section else False
+
+    def is_writable(self) -> bool:
+        if is_cheri() and self.cap_info:
+            tag, caps, _, _, _ = self.cap_info
+            if tag == '1' and 'Store' in caps:
+                return self.section.is_writable() if self.section else False
+            else:
+                return False
+        else:
+            return self.section.is_writable() if self.section else False
 
 
 class Permission(enum.Flag):
@@ -671,13 +727,13 @@ class Section:
         return
 
     def is_readable(self) -> bool:
-        return (self.permission & Permission.READ) != 0
+        return (self.permission & Permission.READ) != Permission.NONE
 
     def is_writable(self) -> bool:
-        return (self.permission & Permission.WRITE) != 0
+        return (self.permission & Permission.WRITE) != Permission.NONE
 
     def is_executable(self) -> bool:
-        return (self.permission & Permission.EXECUTE) != 0
+        return (self.permission & Permission.EXECUTE) != Permission.NONE
 
     @property
     def size(self) -> int:
@@ -2335,16 +2391,19 @@ class Architecture(ArchitectureBase):
         self.__get_register_for_selected_frame.cache_clear()
         return
 
-    def __get_register(self, regname: str) -> int:
+    def __get_register(self, regname: str, full: bool = False) -> int:
         """Return a register's value."""
         curframe = gdb.selected_frame()
         key = curframe.pc() ^ int(curframe.read_register('sp')) # todo: check when/if gdb.Frame implements `level()`
-        return self.__get_register_for_selected_frame(regname, key)
+        return self.__get_register_for_selected_frame(regname, key, full)
 
     @lru_cache()
-    def __get_register_for_selected_frame(self, regname: str, hash_key: int) -> int:
+    def __get_register_for_selected_frame(self, regname: str, hash_key: int, full: bool = False) -> int:
         # 1st chance
         try:
+            if full:
+                reg = gdb.parse_and_eval(regname)
+                return int(reg.format_string(format = 'x'), 16)
             return parse_address(regname)
         except gdb.error:
             pass
@@ -2352,12 +2411,14 @@ class Architecture(ArchitectureBase):
         # 2nd chance - if an exception, propagate it
         regname = regname.lstrip("$")
         value = gdb.selected_frame().read_register(regname)
+        if full:
+            return int(value.format_string(format = 'x'), 16)
         return int(value)
 
-    def register(self, name: str) -> int:
+    def register(self, name: str, full: bool = False) -> int:
         if not is_alive():
             raise gdb.error("No debugging session active")
-        return self.__get_register(name)
+        return self.__get_register(name, full)
 
     @property
     def registers(self) -> Generator[str, None, None]:
@@ -2689,20 +2750,22 @@ class AARCH64(ARM):
     aliases = ("ARM64", "AARCH64", Elf.Abi.AARCH64)
     arch = "ARM64"
     mode: str = ""
+    restricted: bool = False
 
-    all_registers = (
+    all_registers_64 = (
         "$x0", "$x1", "$x2", "$x3", "$x4", "$x5", "$x6", "$x7",
         "$x8", "$x9", "$x10", "$x11", "$x12", "$x13", "$x14","$x15",
         "$x16", "$x17", "$x18", "$x19", "$x20", "$x21", "$x22", "$x23",
         "$x24", "$x25", "$x26", "$x27", "$x28", "$x29", "$x30", "$sp",
         "$pc", "$cpsr", "$fpsr", "$fpcr",)
-    return_register = "$x0"
+    return_register_64 = "$x0"
     flag_register = "$cpsr"
     flags_table = {
         31: "negative",
         30: "zero",
         29: "carry",
         28: "overflow",
+        26: "c64",
         7: "interrupt",
         9: "endian",
         6: "fast",
@@ -2710,13 +2773,82 @@ class AARCH64(ARM):
         4: "m[4]",
     }
     nop_insn = b"\x1f\x20\x03\xd5" # hint #0
-    function_parameters = ("$x0", "$x1", "$x2", "$x3", "$x4", "$x5", "$x6", "$x7",)
+    function_parameters_64 = ("$x0", "$x1", "$x2", "$x3", "$x4", "$x5", "$x6", "$x7",)
     syscall_register = "$x8"
     syscall_instructions = ("svc $x0",)
 
+    # _ptrsize = 8
+
+    all_registers_128 = (
+        "$c0", "$c1", "$c2", "$c3", "$c4", "$c5", "$c6", "$c7",
+        "$c8", "$c9", "$c10", "$c11", "$c12", "$c13", "$c14","$c15",
+        "$c16", "$c17", "$c18", "$c19", "$c20", "$c21", "$c22", "$c23",
+        "$c24", "$c25", "$c26", "$c27", "$c28", "$c29", "$c30", "$csp",
+        "$pcc", "$cpsr", "$fpsr", "$fpcr",)
+
+    all_registers_128_r = (
+        "$c0", "$c1", "$c2", "$c3", "$c4", "$c5", "$c6", "$c7",
+        "$c8", "$c9", "$c10", "$c11", "$c12", "$c13", "$c14","$c15",
+        "$c16", "$c17", "$c18", "$c19", "$c20", "$c21", "$c22", "$c23",
+        "$c24", "$c25", "$c26", "$c27", "$c28", "$c29", "$c30", "$rcsp",
+        "$pcc", "$cpsr", "$fpsr", "$fpcr",)
+    return_register_128 = "$c0"
+    function_parameters_128 = ("$c0", "$c1", "$c2", "$c3", "$c4", "$c5", "$c6", "$c7",)
+
+    seen_cheri = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        abi_str = gdb.execute("show aarch64", to_string=True).strip()
+        _, abi, _ = abi_str.split(' ')[-1].split('"')
+        self.switch_cheri(abi)
+
+    def switch_restricted(self):
+        # self.restricted = False
+        old_restricted = self.restricted
+        if is_alive():
+            pcc = gdb.parse_and_eval('$pcc').cast(cached_lookup_type('__uintcap_t'))
+            if 'Executive' not in parse_cap_internal(pcc)[1]:
+                self.restricted = True
+            else:
+                self.restricted = False
+        if old_restricted != self.restricted:
+            if self.restricted:
+                self.all_registers = self.all_registers_128_r
+            else:
+                self.all_registers = self.all_registers_128
+
+    def switch_cheri(self, abi: str = '') -> None:
+        is_cheri.cache_clear()
+        old_mode = self.mode
+        if abi != '':
+            self.mode = 'C64' if '-cap' in abi else 'A64'
+        else:
+            flags = gef.arch.register(self.flag_register)
+            self.mode = 'C64' if flags & (1 << 26) else 'A64' # hardcoded
+        
+        if old_mode == self.mode:
+            return
+
+        if self.mode == 'C64':
+            if not self.seen_cheri:
+                self.seen_cheri = True
+                gdb.execute('set print compact-capabilities off')
+            self.all_registers = self.all_registers_128
+            self.return_register = self.return_register_128
+            self.function_parameters = self.function_parameters_128
+            self._ptrsize = 16
+            self.switch_restricted()
+
+        elif self.mode == 'A64':
+            self.all_registers = self.all_registers_64
+            self.return_register = self.return_register_64
+            self.function_parameters = self.function_parameters_64
+            self._ptrsize = 8
+
     def is_call(self, insn: Instruction) -> bool:
         mnemo = insn.mnemonic
-        call_mnemos = {"bl", "blr"}
+        call_mnemos = {"bl", "blr", "blrr"}
         return mnemo in call_mnemos
 
     def flag_register_to_human(self, val: Optional[int] = None) -> str:
@@ -2805,6 +2937,17 @@ class AARCH64(ARM):
         if not reason:
             taken, reason = super().is_branch_taken(insn)
         return taken, reason
+
+    @property
+    def ptrsize(self) -> int:
+        return self._ptrsize
+
+    @property
+    def sp(self) -> int:
+        if self.mode == 'C64' and self.restricted == True:
+            return self.register("$rcsp")
+        else:
+            return self.register("$sp")
 
 
 class X86(Architecture):
@@ -3359,6 +3502,7 @@ def copy_to_clipboard(data: bytes) -> None:
 def use_stdtype() -> str:
     if is_32bit(): return "uint32_t"
     elif is_64bit(): return "uint64_t"
+    elif is_128bit(): return "uint128_t"
     return "uint16_t"
 
 
@@ -3442,6 +3586,8 @@ def get_function_length(sym: str) -> int:
 @lru_cache()
 def get_info_files() -> List[Zone]:
     """Retrieve all the files loaded by debuggee."""
+    if not gef.memory.maps_changed() and gef.memory.infos:
+        return gef.memory.infos
     lines = gdb.execute("info files", to_string=True).splitlines()
     infos = []
     for line in lines:
@@ -3463,8 +3609,8 @@ def get_info_files() -> List[Zone]:
             filename = get_filepath()
 
         infos.append(Zone(section_name, addr_start, addr_end, filename))
+    gef.memory.infos = infos
     return infos
-
 
 def process_lookup_address(address: int) -> Optional[Section]:
     """Look up for an address in memory.
@@ -3519,8 +3665,16 @@ def file_lookup_address(address: int) -> Optional[Zone]:
     return None
 
 
-@lru_cache()
 def lookup_address(address: int) -> Address:
+    off = address & (DEFAULT_PAGE_SIZE - 1)
+    page = address - off
+    ret = lookup_address_page(page)
+    if not ret.valid:
+        return Address(value=address, valid=False)
+    return Address(value=address, section=ret.section, info=ret.info, valid=True)
+
+@lru_cache()
+def lookup_address_page(address: int) -> Address:
     """Try to find the address in the process address space.
     Return an Address object, with validity flag set based on success."""
     sect = process_lookup_address(address)
@@ -3528,7 +3682,7 @@ def lookup_address(address: int) -> Address:
     if sect is None and info is None:
         # i.e. there is no info on this address
         return Address(value=address, valid=False)
-    return Address(value=address, section=sect, info=info)
+    return Address(value=address, section=sect, info=info, valid=True)
 
 
 def xor(data: ByteString, key: str) -> bytearray:
@@ -3552,6 +3706,8 @@ def continue_handler(_: "gdb.ContinueEvent") -> None:
 def hook_stop_handler(_: "gdb.StopEvent") -> None:
     """GDB event handler for stop cases."""
     reset_all_caches()
+    if gef.arch.arch == 'ARM64':
+        gef.arch.switch_cheri()
     gdb.execute("context")
     return
 
@@ -3561,15 +3717,19 @@ def new_objfile_handler(evt: Optional["gdb.NewObjFileEvent"]) -> None:
     reset_all_caches()
     path = evt.new_objfile.filename if evt else gdb.current_progspace().filename
     try:
+        old_file = gdb.current_progspace().filename
+        update = False
         if gef.session.root and path.startswith("target:"):
             # If the process is in a container, replace the "target:" prefix
             # with the actual root directory of the process.
             path = path.replace("target:", str(gef.session.root), 1)
         target = pathlib.Path(path)
+        if target != old_file:
+            update = True
         FileFormatClasses = list(filter(lambda fmtcls: fmtcls.is_valid(target), __registered_file_formats__))
         GuessedFileFormatClass : Type[FileFormat] = FileFormatClasses.pop() if len(FileFormatClasses) else Elf
         binary = GuessedFileFormatClass(target)
-        if not gef.binary:
+        if not gef.binary or update:
             gef.binary = binary
             reset_architecture()
         else:
@@ -3657,6 +3817,11 @@ def get_terminal_size() -> Tuple[int, int]:
 
 
 @lru_cache()
+def is_128bit() -> bool:
+    """Checks if current target is 64bit."""
+    return gef.arch.ptrsize == 16
+
+@lru_cache()
 def is_64bit() -> bool:
     """Checks if current target is 64bit."""
     return gef.arch.ptrsize == 8
@@ -3699,7 +3864,6 @@ def reset_architecture(arch: Optional[str] = None) -> None:
     """
     global gef
     arches = __registered_architectures__
-
     # check if the architecture is forced by parameter
     if arch:
         try:
@@ -3729,6 +3893,8 @@ def reset_architecture(arch: Optional[str] = None) -> None:
 @lru_cache()
 def cached_lookup_type(_type: str) -> Optional[gdb.Type]:
     try:
+        if '128' in _type: # 128 bit
+            return gdb.selected_inferior().architecture().integer_type(128)
         return gdb.lookup_type(_type).strip_typedefs()
     except RuntimeError:
         return None
@@ -3771,16 +3937,81 @@ def clear_screen(tty: str = "") -> None:
         gef.config["context.redirect"] = ""
     return
 
+@lru_cache()
+def is_cheri() -> bool:
+    return gef.arch.mode == 'C64'
 
-def format_address(addr: int) -> str:
+@lru_cache()
+def is_aarch64() -> bool:
+    return gef.arch.arch == 'ARM64'
+
+@lru_cache()
+def parse_cap_internal(src: gdb.Value) -> tuple:
+    raw_info = str(src)[:-1]
+    if 'tag = ' not in raw_info: # not a cap
+        return ''
+    # print(raw_info)
+    tag = raw_info.split('tag = ')[1].split(',')[0]
+    caps = set(raw_info.split('permissions = {[ ')[1].split(' ]')[0].split(' '))
+    bound_start, bound_end = [
+        int(x.rstrip(')}'), 16) for x in
+        raw_info.split('range = [')[1].split(' - ')
+    ]
+    otype = 0
+    if 'otype' in raw_info:
+        otype = int(raw_info.split('otype = ')[1].split(',')[0],16)
+    return (tag, caps, bound_start, bound_end, otype)
+
+@lru_cache()
+def parse_cap(src: gdb.Value) -> str:
+    ret = parse_cap_internal(src)
+    if len(ret) == 0:
+        return ''
+    else:
+        return format_cap(ret)
+
+def format_cap(val: tuple) -> str:
+    tag, caps, bound_start, bound_end, otype = val
+    bound_len = bound_end - bound_start
+    # Formatting currently follows compact mode,
+    # with addition of bound length
+    translate = [
+        ('Load', 'r'),
+        ('Store', 'w'),
+        ('Execute', 'x'),
+        ('LoadCap', 'R'),
+        ('StoreCap', 'W'),
+        ('Executive', 'X'),
+    ]
+    perms = ''.join([c for n,c in translate if n in caps])
+    perms = perms if perms != '' else '-'
+    out = f' [{perms},{bound_start:#x}-{bound_end:#x},len={bound_len:#x}]'
+    additional = ''
+    CAP_SEAL_TYPE_RB = 1
+    if tag != '1':
+        additional = 'bad'
+    else:
+        if otype == CAP_SEAL_TYPE_RB:
+            additional = 'sen'
+        elif otype != 0:
+            additional = 'seal'
+    if additional != '':
+        out += f' ({additional})'
+    return out
+
+def format_address(addr: int, src: gdb.Value = None) -> str:
     """Format the address according to its size."""
     memalign_size = gef.arch.ptrsize
     addr = align_address(addr)
+    cap = ""
+
+    if is_cheri() and src:
+        cap = parse_cap(src)
 
     if memalign_size == 4:
-        return f"0x{addr:08x}"
+        return f"0x{addr:08x}" + cap
 
-    return f"0x{addr:016x}"
+    return f"0x{addr:016x}" + cap
 
 
 def format_address_spaces(addr: int, left: bool = True) -> str:
@@ -3796,10 +4027,8 @@ def format_address_spaces(addr: int, left: bool = True) -> str:
 
 def align_address(address: int) -> int:
     """Align the provided address to the process's native length."""
-    if gef.arch.ptrsize == 4:
-        return address & 0xFFFFFFFF
-
-    return address & 0xFFFFFFFFFFFFFFFF
+    mask = (1 << gef.arch.ptrsize * 8) - 1
+    return address & mask
 
 
 def align_address_to_size(address: int, align: int) -> int:
@@ -5767,7 +5996,7 @@ class ScanSectionCommand(GenericCommand):
                 target = unpack(mem[i:i+step])
                 for nstart, nend in needle_sections:
                     if target >= nstart and target < nend:
-                        deref = DereferenceCommand.pprint_dereferenced(hstart, int(i / step))
+                        deref, _ = DereferenceCommand.pprint_dereferenced(hstart, int(i / step))
                         if hname != "":
                             name = Color.colorify(hname, "yellow")
                             gef_print(f"{name}: {deref}")
@@ -5878,6 +6107,8 @@ class SearchPatternCommand(GenericCommand):
             if not section.permission & Permission.READ: continue
             if section.path == "[vvar]": continue
             if not section_name in section.path: continue
+            # If in cheri revoke shadow page
+            if section.page_end - section.page_start > (1 << 40): continue
 
             start = section.page_start
             end = section.page_end - 1
@@ -6888,17 +7119,19 @@ class DetailRegistersCommand(GenericCommand):
             reg = gdb.parse_and_eval(regname)
             if reg.type.code == gdb.TYPE_CODE_VOID:
                 continue
-
             padreg = regname.ljust(widest, " ")
 
-            if str(reg) == "<unavailable>":
-                gef_print(f"{Color.colorify(padreg, unchanged_color)}: "
-                          f"{Color.colorify('no value', 'yellow underline')}")
-                continue
+            # if str(reg) == "<unavailable>":
+            #     gef_print(f"{Color.colorify(padreg, unchanged_color)}: "
+            #               f"{Color.colorify('no value', 'yellow underline')}")
+            #     continue
 
+            ref_val = int(reg.format_string(format='x'), 16) # fix for 128 bit
+            # print(hex_val)
             value = align_address(int(reg))
             old_value = ContextCommand.old_registers.get(regname, 0)
-            if value == old_value:
+            # print(hex(old_value), hex(ref_val))
+            if ref_val == old_value:
                 color = unchanged_color
             else:
                 color = changed_color
@@ -6916,23 +7149,28 @@ class DetailRegistersCommand(GenericCommand):
                 gef_print(line)
                 continue
 
-            addr = lookup_address(align_address(int(value)))
-            if addr.valid:
-                line += str(addr)
-            else:
-                line += format_address_spaces(value)
-            addrs = dereference_from(value)
+            # addr = lookup_address(align_address(int(value)))
+            addrs = dereference_from(value, reg)
 
             if len(addrs) > 1:
                 sep = f" {RIGHT_ARROW} "
-                line += sep
-                line += sep.join(addrs[1:])
+                line += sep.join(addrs)
+            else:
+                # print(addrs)
+                if '[' in addrs[0]: # If is cheri cap
+                    line += addrs[0]
+                else:
+                    line += format_address_spaces(value)
 
             # check to see if reg value is ascii
             try:
-                fmt = f"{endian}{'I' if memsize == 4 else 'Q'}"
+                fmt = f"{endian}{'I' if memsize == 4 else 'Q' * (memsize // 8)}"
                 last_addr = int(addrs[-1], 16)
-                val = gef_pystring(struct.pack(fmt, last_addr))
+                if len(fmt) == 3:
+                    mask = (1 << 64) - 1
+                    val = gef_pystring(struct.pack(fmt, last_addr & mask, last_addr >> 64))
+                else:
+                    val = gef_pystring(struct.pack(fmt, last_addr))
                 if all([_ in charset for _ in val]):
                     line += f" (\"{Color.colorify(val, string_color)}\"?)"
             except ValueError:
@@ -7414,7 +7652,16 @@ class ContextCommand(GenericCommand):
                         continue
                 if pane_title_function:
                     self.context_title(pane_title_function())
+
+                start = time.time()
                 display_pane_function()
+                # with cProfile.Profile() as pr:
+                    
+                #     print(display_pane_function)
+                #     ps = pstats.Stats(pr).sort_stats('cumtime')
+                #     ps.print_callers()
+                elapsed = time.time() - start
+                # print(display_pane_function, elapsed)
             except gdb.MemoryError as e:
                 # a MemoryError will happen when $pc is corrupted (invalid address)
                 err(str(e))
@@ -7426,6 +7673,7 @@ class ContextCommand(GenericCommand):
 
         if redirect and os.access(redirect, os.W_OK):
             disable_redirect_output()
+        # print(dereference_from.cache_info())
         return
 
     def context_title(self, m: Optional[str]) -> None:
@@ -7461,7 +7709,10 @@ class ContextCommand(GenericCommand):
         if self["show_registers_raw"] is False:
             regs = [reg for reg in gef.arch.all_registers if reg not in ignored_registers]
             printable_registers = " ".join(regs)
-            gdb.execute(f"registers {printable_registers}")
+            if len(ignored_registers) == 0:
+                gdb.execute("registers")
+            else:
+                gdb.execute(f"registers {printable_registers}")
             return
 
         widest = l = max(map(len, gef.arch.all_registers))
@@ -7626,6 +7877,7 @@ class ContextCommand(GenericCommand):
             2: "WORD",
             4: "DWORD",
             8: "QWORD",
+            16: "void * __capability"
         }
 
         if insn.operands[-1].startswith(self.size2type[gef.arch.ptrsize]+" PTR"):
@@ -7659,8 +7911,11 @@ class ContextCommand(GenericCommand):
         args = []
 
         for i, f in enumerate(symbol.type.fields()):
-            _value = gef.arch.get_ith_parameter(i, in_func=False)[1]
-            _value = RIGHT_ARROW.join(dereference_from(_value))
+            _reg, _value = gef.arch.get_ith_parameter(i, in_func=False)
+            _cap = None
+            if is_cheri():
+                _cap = gdb.parse_and_eval(_reg)# .cast(cached_lookup_type('__uintcap_t'))
+            _value = RIGHT_ARROW.join(dereference_from(_value, _cap))
             _name = f.name or f"var_{i}"
             _type = f.type.name or self.size2type[f.type.sizeof]
             args.append(f"{_type} {_name} = {_value}")
@@ -7726,8 +7981,15 @@ class ContextCommand(GenericCommand):
         args = []
         for i in range(nb_argument):
             _key, _values = gef.arch.get_ith_parameter(i, in_func=False)
-            _values = RIGHT_ARROW.join(dereference_from(_values))
-            args.append(f"{Color.colorify(_key, arg_key_color)} = {_values}")
+            _cap = None
+            if is_cheri():
+                _cap = gdb.parse_and_eval(_key)# .cast(cached_lookup_type('__uintcap_t'))
+            _values = RIGHT_ARROW.join(dereference_from(_values, _cap))
+            try:
+                args.append("{} = {} (def: {})".format(Color.colorify(_key, arg_key_color), _values,
+                                                       gef.ui.libc_args_table[_arch_mode][_function_name][_key]))
+            except KeyError:
+                args.append(f"{Color.colorify(_key, arg_key_color)} = {_values}")
 
         self.context_title("arguments (guessed)")
         gef_print(f"{function_name} (")
@@ -7868,11 +8130,16 @@ class ContextCommand(GenericCommand):
             name = current_frame.name()
             items = []
             items.append(f"{pc:#x}")
+            uintcap = cached_lookup_type('__uintcap_t')
+            is_ptr = lambda v: v.type.code == gdb.TYPE_CODE_PTR
+            conv = lambda v: format_address(int(v.format_string(format='x'), 16) & (1<<64) - 1,
+                                             v.cast(uintcap)) if is_cheri() and is_ptr(v) and not v.is_optimized_out else v
             if name:
                 frame_args = gdb.FrameDecorator.FrameDecorator(current_frame).frame_args() or []
                 m = "{}({})".format(Color.greenify(name),
                                     ", ".join(["{}={!s}".format(Color.yellowify(x.sym),
-                                                                x.sym.value(current_frame)) for x in frame_args]))
+                                                                conv(x.sym.value(current_frame))
+                                                                ) for x in frame_args]))
                 items.append(m)
             else:
                 try:
@@ -7891,7 +8158,11 @@ class ContextCommand(GenericCommand):
 
             gef_print("[{}] {}".format(Color.colorify(f"#{level}", "bold green" if current_frame == orig_frame else "bold pink"),
                                        RIGHT_ARROW.join(items)))
-            current_frame = current_frame.older()
+            try:
+                current_frame_tmp = current_frame.older()
+            except:
+                current_frame_tmp = current_frame.older() # Try again
+            current_frame = current_frame_tmp
             level += 1
             nb_backtrace -= 1
             if nb_backtrace == 0:
@@ -7994,7 +8265,7 @@ class ContextCommand(GenericCommand):
     def update_registers(cls, _) -> None:
         for reg in gef.arch.all_registers:
             try:
-                cls.old_registers[reg] = gef.arch.register(reg)
+                cls.old_registers[reg] = gef.arch.register(reg, full = True)
             except Exception:
                 cls.old_registers[reg] = 0
         return
@@ -8389,7 +8660,7 @@ class PatchStringCommand(GenericCommand):
 
 
 @lru_cache()
-def dereference_from(address: int) -> List[str]:
+def dereference_from(address: int, orig: gdb.Value = None) -> List[str]:
     if not is_alive():
         return [format_address(address),]
 
@@ -8397,10 +8668,23 @@ def dereference_from(address: int) -> List[str]:
     string_color = gef.config["theme.dereference_string"]
     max_recursion = gef.config["dereference.max_recursion"] or 10
     addr = lookup_address(align_address(address))
-    msg = [format_address(addr.value),]
+    if is_cheri():
+        uintcap = cached_lookup_type('__uintcap_t')
+        if orig:
+            src = orig.cast(uintcap)
+            if 'tag = ' not in str(src): # not a ptr
+                # invalidation
+                addr.section = None
+                addr.zone = None
+            else:
+                addr.set_src(src)
+        else:
+            src = None
+        prevs = [(addr, src),]
+    msg = [str(addr),]
     seen_addrs = set()
 
-    while addr.section and max_recursion:
+    while addr.is_readable() and max_recursion:
         if addr.value in seen_addrs:
             msg.append("[loop detected]")
             break
@@ -8417,15 +8701,26 @@ def dereference_from(address: int) -> List[str]:
             break
 
         new_addr = lookup_address(deref)
+
         if new_addr.valid:
+            if is_cheri():
+                # prevs.append((new_addr, addr.value))
+                ull = gdb.Value(p64(addr.value), cached_lookup_type('unsigned long long'))
+                cap = ull.cast(uintcap.pointer()).dereference()
+                new_addr.set_src(cap)
             addr = new_addr
             msg.append(str(addr))
             continue
 
         # -- Otherwise try to parse the value
         if addr.section:
-            if addr.section.is_executable() and addr.is_in_text_segment() and not is_ascii_string(addr.value):
-                insn = gef_current_instruction(addr.value)
+            if addr.is_executable(): # and not is_ascii_string(addr.value):
+                # and addr.is_in_text_segment() not needed, could be JIT etc.
+                # print(addr, addr.cap_info)
+                off = 0
+                if is_aarch64() and addr.value & 1:
+                    off = 1
+                insn = gef_current_instruction(addr.value - off)
                 insn_str = f"{insn.location} {insn.mnemonic} {', '.join(insn.operands)}"
                 msg.append(Color.colorify(insn_str, code_color))
                 break
@@ -8448,6 +8743,23 @@ def dereference_from(address: int) -> List[str]:
         msg.append(val)
         break
 
+    # if is_cheri():
+    #     # print('orig', msg)
+    #     # print('prevs', prevs)
+    #     start_addr, _ = prevs[0]
+    #     if start_addr.section:
+    #         for i, p in enumerate(prevs):
+    #             addrobj, src = p
+    #             if isinstance(src, int):
+    #                 ull = gdb.Value(p64(src), cached_lookup_type('unsigned long long'))
+    #                 cap = ull.cast(uintcap.pointer()).dereference()
+    #             else:
+    #                 cap = src
+    #             addrobj.set_src(cap)
+    #             # print(str(addrobj))
+    #             msg[i] = str(addrobj)
+    #     # print('modded', msg)
+    # print(prevs)
     return msg
 
 
@@ -8467,7 +8779,7 @@ class DereferenceCommand(GenericCommand):
         return
 
     @staticmethod
-    def pprint_dereferenced(addr: int, idx: int, base_offset: int = 0) -> str:
+    def pprint_dereferenced(addr: int, idx: int, base_offset: int = 0, regs: list = None) -> str:
         base_address_color = gef.config["theme.dereference_base_address"]
         registers_color = gef.config["theme.dereference_register_value"]
 
@@ -8478,24 +8790,30 @@ class DereferenceCommand(GenericCommand):
         current_address = align_address(addr + offset)
         addrs = dereference_from(current_address)
         l = ""
-        addr_l = format_address(int(addrs[0], 16))
+        addr_l = format_address(current_address)
+        # print(addrs)
         l += "{}{}{:+#07x}: {:{ma}s}".format(Color.colorify(addr_l, base_address_color),
                                              VERTICAL_LINE, base_offset+offset,
                                              sep.join(addrs[1:]), ma=(memalign*2 + 2))
 
         register_hints = []
 
-        for regname in gef.arch.all_registers:
-            regvalue = gef.arch.register(regname)
-            if current_address == regvalue:
-                register_hints.append(regname)
+        if not regs: 
+            for regname in gef.arch.all_registers:
+                regvalue = gef.arch.register(regname)
+                if current_address == regvalue:
+                    register_hints.append(regname)
+        else:
+            for reg, val in regs.items():
+                if current_address == val:
+                    register_hints.append(reg)
 
         if register_hints:
             m = f"\t{LEFT_ARROW}{', '.join(list(register_hints))}"
             l += Color.colorify(m, registers_color)
 
         offset += memalign
-        return l
+        return l, len(addrs)
 
     @only_if_gdb_running
     @parse_arguments({"address": "$sp"}, {("-r", "--reference"): "", ("-l", "--length"): 10})
@@ -8537,8 +8855,12 @@ class DereferenceCommand(GenericCommand):
         start_address = align_address(target_addr)
         base_offset = start_address - align_address(ref_addr)
 
+        regs = {regname: gef.arch.register(regname) for regname in gef.arch.all_registers}
         for i in range(from_insnum, to_insnum, insnum_step):
-            gef_print(DereferenceCommand.pprint_dereferenced(start_address, i, base_offset))
+            outs, ll = DereferenceCommand.pprint_dereferenced(start_address, i, base_offset, regs)
+            gef_print(outs)
+            if ll == 1:
+                break
 
         return
 
@@ -10396,13 +10718,20 @@ class GefManager(metaclass=abc.ABCMeta):
 
 class GefMemoryManager(GefManager):
     """Class that manages memory access for gef."""
+
+    __maps = None
+    infos = None
+
     def __init__(self) -> None:
         self.reset_caches()
+        self.__prev_maps_raw = ''
         return
 
     def reset_caches(self) -> None:
         super().reset_caches()
+        self.__prev_maps = self.__maps
         self.__maps = None
+        self.__changed = False
         return
 
     def write(self, address: int, buffer: ByteString, length: Optional[int] = None) -> None:
@@ -10427,12 +10756,13 @@ class GefMemoryManager(GefManager):
                      encoding: Optional[str] = None) -> str:
         """Return a C-string read from memory."""
         encoding = encoding or "unicode-escape"
-        length = min(address | (DEFAULT_PAGE_SIZE-1), max_length+1)
+        # print(address | (DEFAULT_PAGE_SIZE-1))
+        length = min((address | (DEFAULT_PAGE_SIZE-1)) - address, max_length+1)
 
         try:
             res_bytes = self.read(address, length)
         except gdb.error:
-            err(f"Can't read memory at '{address}'")
+            err(f"Can't read memory at '{address}' with length {length}")
             return ""
         try:
             with warnings.catch_warnings():
@@ -10456,69 +10786,93 @@ class GefMemoryManager(GefManager):
             return cstr
         return None
 
+
+    def maps_changed(self) -> bool:
+        return self.__changed
+
     @property
     def maps(self) -> List[Section]:
         if not self.__maps:
-            self.__maps = self._parse_maps()
+            self.__maps = self.__parse_maps()
         return self.__maps
 
-    @classmethod
-    def _parse_maps(cls) -> List[Section]:
-        """Return the mapped memory sections. If the current arch has its maps
-        method defined, then defer to that to generated maps, otherwise, try to
-        figure it out from procfs, then info sections, then monitor info
-        mem."""
-        if gef.arch.maps is not None:
-            return list(gef.arch.maps())
-
+    def __parse_maps(self) -> List[Section]:
+        """Return the mapped memory sections"""
         try:
-            return list(cls.parse_procfs_maps())
-        except:
-            pass
+            return self.__parse_procfs_maps()
+        except FileNotFoundError:
+            return list(self.__parse_gdb_info_sections())
 
-        try:
-            return list(cls.parse_gdb_info_sections())
-        except:
-            pass
+    def __translate_freebsd(self, line) -> str:
+        data = line.split()
+        if len(data) == 0 or '0x' not in data[0]:
+            return ''
+        if len(data) == 7:
+            start, end, _, off, perms, flags, path = data
+        else:
+            start, end, _, off, perms, flags = data
+            path = ''
+        start = start[2:]
+        end = end[2:]
+        off = off[2:]
+        inode = 0 # :(
+        # flags used only by stack
+        if flags[-1] == 'D' or flags[-1] == 'U':
+            path = '[stack]'
+        translated = f'{start}-{end} {perms}p {off} 0 {inode} {path}'
+        return translated
 
-        try:
-            return list(cls.parse_monitor_info_mem())
-        except:
-            pass
-
-        warn("Cannot get memory map")
-        return None
-
-    @staticmethod
-    def parse_procfs_maps() -> Generator[Section, None, None]:
+    def __parse_procfs_maps(self) -> List[Section]:
         """Get the memory mapping from procfs."""
         procfs_mapfile = gef.session.maps
         if not procfs_mapfile:
             is_remote = gef.session.remote is not None
             raise FileNotFoundError(f"Missing {'remote ' if is_remote else ''}procfs map file")
-        with procfs_mapfile.open("r") as fd:
-            for line in fd:
-                line = line.strip()
-                addr, perm, off, _, rest = line.split(" ", 4)
-                rest = rest.split(" ", 1)
-                if len(rest) == 1:
-                    inode = rest[0]
-                    pathname = ""
-                else:
-                    inode = rest[0]
-                    pathname = rest[1].lstrip()
 
-                addr_start, addr_end = parse_string_range(addr)
-                off = int(off, 16)
-                perm = Permission.from_process_maps(perm)
-                inode = int(inode)
-                yield Section(page_start=addr_start,
-                              page_end=addr_end,
-                              offset=off,
-                              permission=perm,
-                              inode=inode,
-                              path=pathname)
-        return
+        is_freebsd = platform.system() == 'FreeBSD'
+        ret = []
+        if is_freebsd:
+            data = gdb.execute('info proc mappings', to_string = True)
+        else:
+            fobj = procfs_mapfile.open("r")
+            data = fobj.read()
+            fobj.close()
+
+        # No change
+        if self.__prev_maps_raw == data:
+            return self.__prev_maps
+
+        self.__prev_maps_raw = data
+        self.__changed = True
+
+        lines = data.split("\n")
+        for line in lines:
+            line = line.strip()
+            if is_freebsd:
+                line = self.__translate_freebsd(line)
+                if line == '':
+                    continue
+            addr, perm, off, _, rest = line.split(" ", 4)
+            rest = rest.split(" ", 1)
+            if len(rest) == 1:
+                inode = rest[0]
+                pathname = ""
+            else:
+                inode = rest[0]
+                pathname = rest[1].lstrip()
+
+            addr_start, addr_end = parse_string_range(addr)
+            off = int(off, 16)
+            perm = Permission.from_process_maps(perm)
+            inode = int(inode)
+            sect = Section(page_start=addr_start,
+                        page_end=addr_end,
+                        offset=off,
+                        permission=perm,
+                        inode=inode,
+                        path=pathname)
+            ret.append(sect)
+        return ret
 
     @staticmethod
     def parse_gdb_info_sections() -> Generator[Section, None, None]:
@@ -10765,6 +11119,7 @@ class GefHeapManager(GefManager):
         return malloc_alignment * ceil((address / malloc_alignment))
 
 
+
 class GefSetting:
     """Basic class for storing gef settings as objects"""
 
@@ -10796,7 +11151,6 @@ class GefSetting:
     def no_spaces(value):
         if " " in value:
             raise ValueError("setting cannot contain spaces")
-
 
 class GefSettingsManager(dict):
     """
@@ -10978,7 +11332,12 @@ class GefSessionManager(GefManager):
             if gef.session.remote is not None:
                 self._maps = gef.session.remote.maps
             else:
-                self._maps = pathlib.Path(f"/proc/{self.pid}/maps")
+                if platform.system() == 'FreeBSD':
+                    map_path = f"/proc/{self.pid}/map"
+                else:
+                    map_path = f"/proc/{self.pid}/maps"
+
+                self._maps = pathlib.Path(map_path)
         return self._maps
 
     @property
