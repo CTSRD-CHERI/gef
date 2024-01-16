@@ -10,5 +10,7 @@ echo source /path/to/gef.py >> ~/.gdbinit
 
 - Fix `vmmap` for FreeBSD and CheriBSD.
 - `telescope XXX` shows 0x10-byte aligned addresses.
+- Scan memory for valid capabilities stored in `source` and pointing to `destination`. 
+    - `scancaps [source] [destination]` 
 
 See also [gef-plugins](https://github.com/CTSRD-CHERI/gef-plugins).
