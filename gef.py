@@ -1952,7 +1952,7 @@ def style_byte(b: int, color: bool = True) -> str:
     return sbyte
 
 
-def hexdump(source: ByteString, length: int = 0x10, separator: str = ".", show_raw: bool = False, show_symbol: bool = True, base: int = 0x00) -> str:
+def hexdump(source: ByteString, length: int = 0x10, separator: str = ".", show_raw: bool = False, show_symbol: bool = True, base: int = 0x00, align = None) -> str:
     """Return the hexdump of `src` argument.
     @param source *MUST* be of type bytes or bytearray
     @param length is the length of items per line
@@ -1961,7 +1961,8 @@ def hexdump(source: ByteString, length: int = 0x10, separator: str = ".", show_r
     @param base is the start address of the block being hexdump
     @return a string with the hexdump"""
     result = []
-    align = gef.arch.ptrsize * 2 + 2 if is_alive() else 18
+    if not align:
+        align = gef.arch.ptrsize * 2 + 2 if is_alive() else 18
 
     for i in range(0, len(source), length):
         chunk = bytearray(source[i : i + length])
@@ -7572,7 +7573,7 @@ class ContextCommand(GenericCommand):
         self["nb_lines_code"] = (6, "Number of instruction after $pc")
         self["nb_lines_code_prev"] = (3, "Number of instruction before $pc")
         self["ignore_registers"] = ("", "Space-separated list of registers not to display (e.g. '$cs $ds $gs')")
-        self["clear_screen"] = (True, "Clear the screen before printing the context")
+        self["clear_screen"] = (False, "Clear the screen before printing the context")
         self["layout"] = ("legend regs stack code args source memory threads trace extra", "Change the order/presence of the context sections")
         self["redirect"] = ("", "Redirect the context information to another TTY")
         self["libc_args"] = (False, "[DEPRECATED - Unused] Show libc function call args description")
