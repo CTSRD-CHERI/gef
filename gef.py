@@ -2347,6 +2347,7 @@ class Architecture(ArchitectureBase):
 
     # Optionally defined attributes
     _ptrsize: Optional[int] = None
+    _adrsize: Optional[int] = None
     _endianness: Optional[Endianness] = None
     special_registers: Union[Tuple[()], Tuple[str, ...]] = ()
     maps: Optional[GefMemoryMapProvider] = None
@@ -2447,9 +2448,17 @@ class Architecture(ArchitectureBase):
         return self.register("$fp")
 
     @property
+    def adrsize(self) -> int:
+        if not self._adrsize:
+            res = cached_lookup_type("size_t")
+            if res is not None:
+                self._adrsize = res.sizeof
+        return self._adrsize
+
+    @property
     def ptrsize(self) -> int:
         if not self._ptrsize:
-            res = cached_lookup_type("size_t")
+            res = cached_lookup_type("uintptr_t")
             if res is not None:
                 self._ptrsize = res.sizeof
             else:
@@ -12033,7 +12042,7 @@ if __name__ == "__main__":
         "set print pretty on",
         "set disassembly-flavor intel",
         "handle SIGALRM print nopass",
-        "set print asm-demangle on",
+        # "set print asm-demangle on",
     )
     for cmd in gdb_initial_settings:
         try:
