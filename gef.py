@@ -11029,6 +11029,37 @@ class GefMemoryManager(GefManager):
             return cstr
         return None
 
+    def read_captags(self, addr: int, length: int) -> bytes:
+        STRIDE = 0x10 * 8 # 0x10 (bytes per cap) * 8 (bits) per byte of bitmask
+        bmlen = length // STRIDE
+        if length % STRIDE: bmlen += 1
+        bitmap = ctypes.create_string_buffer(bmlen)
+        class ptrace_io_desc(ctypes.Structure):
+            _fields_ = [('piod_op', ctypes.c_int),
+                        ('piod_offs', ctypes.c_uint64),
+                        ('piod_addr', ctypes.c_uint64),
+                        ('piod_len', ctypes.c_size_t)]
+        desc = ptrace_io_desc()
+        PIOD_READ_CHERI_TAGS = 5
+        desc.piod_op = PIOD_READ_CHERI_TAGS
+        desc.piod_offs = addr
+        desc.piod_addr = ctypes.addressof(bitmap)
+        desc.piod_len = bmlen
+        libc = ctypes.CDLL(None)
+        ptrace = libc.syscall
+        ptrace.argtypes = (ctypes.c_uint64,) * 4
+        # print(ctypes.addressof(desc))
+        PTRACE = 26
+        PT_IO = 12
+        res = ptrace(PTRACE,
+                    PT_IO,
+                    gdb.selected_inferior().pid,
+                    ctypes.addressof(desc),
+                    0)
+        if res != 0:
+            raise RuntimeError
+        return bitmap.raw
+
     @property
     def maps(self) -> List[Section]:
         if not self.__maps:
