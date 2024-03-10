@@ -2868,6 +2868,8 @@ class AARCH64(ARM):
             self.return_register = self.return_register_128
             self.function_parameters = self.function_parameters_128
             self._ptrsize = 16
+            # hack: CheriBSD readelf is broken, point to llvm-readelf
+            gef.session.constants['readelf'] = 'llvm-readelf'
             self.switch_restricted()
 
         elif self.mode == 'A64':
@@ -11014,7 +11016,7 @@ class GefMemoryManager(GefManager):
 
     def read_integer(self, addr: int) -> int:
         """Return an integer read from memory."""
-        sz = gef.arch.ptrsize
+        sz = gef.arch.adrsize
         mem = self.read(addr, sz)
         unpack = u32 if sz == 4 else u64
         return unpack(mem)
