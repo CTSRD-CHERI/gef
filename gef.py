@@ -4090,7 +4090,12 @@ def parse_address(address: str) -> int:
     """Parse an address and return it as an Integer."""
     if is_hex(address):
         return int(address, 16)
-    return int(gdb.parse_and_eval(address))
+    val = gdb.parse_and_eval(address)
+    if is_cheri():
+        if str(val.type) == '__uintcap_t':
+            ptrtype = cached_lookup_type('unsigned long long').pointer()
+            return int(val.cast(ptrtype))
+    return int(val)
 
 
 def is_in_x86_kernel(address: int) -> bool:
@@ -8905,6 +8910,27 @@ class DereferenceCommand(GenericCommand):
 
         target = args.address
         target_addr = parse_address(target)
+
+        # warn if we are trying to dereference a capability that is either untagged or without the required permissions
+        if is_cheri():
+            uintcap = cached_lookup_type('__uintcap_t')
+            try:
+                target_cap = gdb.parse_and_eval(target).cast(uintcap)
+                capinfo = parse_cap_internal(target_cap)
+                is_invalid = False
+                if capinfo != '':
+                    tag, perms, bound_start, bound_end, otype = capinfo
+                    if tag != '1':
+                        is_invalid = True
+                    if 'Load' not in perms:
+                        is_invalid = True
+                else: # not a capability?
+                    warn("Couldn't parse capability internal fields")
+                if is_invalid:
+                    warn("Dereferencing an invalid capability!")
+            except gdb.error:
+                # we didn't supply a capability, so this check doesn't make sense
+                pass
 
         reference = args.reference or target
         ref_addr = parse_address(reference)
