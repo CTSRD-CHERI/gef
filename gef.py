@@ -333,6 +333,11 @@ def u64(x: bytes, s: bool = False, e: Optional["Endianness"] = None) -> int:
     return struct.unpack(f"{endian}Q", x)[0] if not s else struct.unpack(f"{endian:s}q", x)[0]
 
 
+def align_down(x: int, alignment: int) -> int:
+    """Rounds `x` down to nearest multiple of the `alignment`."""
+    return x - x % alignment
+
+
 def is_ascii_string(address: int) -> bool:
     """Helper function to determine if the buffer pointed by `address` is an ASCII string (in GDB)"""
     try:
@@ -11999,6 +12004,116 @@ class GefLibcManager(GefManager):
         return 0, 0
 
 
+class GefHeapCaprevokeManager(GefManager):
+    """Class managing mrs capability revocation state. *Note*: only heap."""
+    VM_CHERI_REVOKE_GSZ_MEM_NOMAP = 16 # size of a capability, since CapRevoke is only on CHERI archs
+
+    def __init__(self) -> None:
+        self.reset_caches()
+        return
+
+    def reset_caches(self) -> None:
+        super().reset_caches()
+        self.__read_chunks()
+        return
+
+    def __read_chunks(self) -> None:
+        self.__chunks = list() # list of chunks in quarantine
+        self.__chunk_sizes = list() # their sizes as recorded by mrs
+        self.__has_quarantine = False
+        try:
+            app_quarantine = gdb.parse_and_eval('application_quarantine')
+        except:
+            app_quarantine = None
+        if app_quarantine:
+            self.__has_quarantine = True
+            self.__quarantine_size = int(app_quarantine['size'])
+            self.__quarantine_max_size = int(app_quarantine['max_size'])
+            curr = app_quarantine['list']
+            while int(curr) != 0:
+                num_desc = curr['num_descriptors']
+                # for i in range(num_desc):
+                #     self.__chunks.add(int(curr['slab'][i]['ptr']))
+
+                # Single read optimisation
+                desc_sz = curr['slab'][0].type.sizeof
+                data = gef.memory.read(curr['slab'], num_desc * desc_sz)
+                # this only reads the address part of a pointer
+                self.__chunks = [
+                    u64(data[i * desc_sz:i * desc_sz + 8])
+                    for i in range(num_desc)
+                ]
+                self.__chunk_sizes = [
+                    u64(data[i * desc_sz + gef.arch.ptrsize:i * desc_sz + gef.arch.ptrsize + 8])
+                    for i in range(num_desc)
+                ]
+                # XXXR3: instead parse them as capabilities, if applicable?
+                curr = curr['next'] # TODO: next slab? data is overwritten...
+
+    @property
+    def chunks(self):
+        return self.__chunks
+
+    @property
+    def chunk_sizes(self):
+        return self.__chunk_sizes
+
+    @property
+    def has_quarantine(self):
+        return self.__has_quarantine
+
+    @property
+    def quarantining(self) -> bool:
+        try:
+            ret = bool(gdb.parse_and_eval('quarantining'))
+        except gdb.error:
+            ret = False
+        return ret
+
+    @property
+    def allocated_size(self) -> int:
+        try:
+            ret = int(gdb.parse_and_eval('allocated_size'))
+        except gdb.error:
+            ret = -1
+        return ret
+    
+    @property
+    def max_allocated_size(self) -> int:
+        try:
+            ret = int(gdb.parse_and_eval('max_allocated_size'))
+        except gdb.error:
+            ret = -1
+        return ret
+
+    @property
+    def quarantine_size(self) -> int:
+        return self.__quarantine_size
+
+    @property
+    def quarantine_max_size(self) -> int:
+        return self.__quarantine_max_size
+
+    @property
+    def entire_shadow(self) -> Address:
+        try:
+            uintcap = cached_lookup_type('__uintcap_t')
+            addr = parse_address('entire_shadow')
+            shadow_cap = Address(value=addr)
+            shadow_cap.set_src(gdb.parse_and_eval('entire_shadow').cast(uintcap))
+        except gdb.error:
+            shadow_cap = None
+        return shadow_cap
+
+    def get_shadow_bit_addr(self, heap_addr: int) -> int:
+        """Get the address of the revocation bit of the first word."""
+        fwo = align_down((heap_addr // self.VM_CHERI_REVOKE_GSZ_MEM_NOMAP) // 8, 8)
+        return int(self.entire_shadow) + fwo
+
+    def get_shadow_bit(self, heap_addr: int) -> int:
+        """Revocation bit value of the first word."""
+        shadow_bit_addr = self.get_shadow_bit_addr(heap_addr)
+        return u8(gef.memory.read(shadow_bit_addr, 1)) & 1
 
 
 class Gef:
@@ -12030,6 +12145,7 @@ class Gef:
         self.memory = GefMemoryManager()
         self.heap = GefHeapManager()
         self.session = GefSessionManager()
+        self.heap_caprevoke = GefHeapCaprevokeManager()
         return
 
     def setup(self) -> None:
@@ -12043,7 +12159,7 @@ class Gef:
     def reset_caches(self) -> None:
         """Recursively clean the cache of all the managers. Avoid calling this function directly, using `reset-cache`
         is preferred"""
-        for mgr in (self.memory, self.heap, self.session, self.arch):
+        for mgr in (self.memory, self.heap, self.session, self.arch, self.heap_caprevoke):
             mgr.reset_caches()
         return
 
